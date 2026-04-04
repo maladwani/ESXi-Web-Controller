@@ -1,12 +1,13 @@
 import os
-import json
 import ssl
 import requests
-import asyncio
-import subprocess
 import paramiko
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from pydantic import BaseModel
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Depends
+from pydantic import BaseModel, Field, model_validator
+from typing import Literal
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim
 from requests.auth import HTTPBasicAuth
@@ -14,6 +15,16 @@ from dotenv import load_dotenv
 import urllib3
 from fastapi.middleware.cors import CORSMiddleware
 import base64
+
+from auth import create_access_token, get_current_user, hash_password, verify_password
+from db import init_db, get_db
+from models import User
+from sqlalchemy.orm import Session
+from provision import (
+    create_vm_from_iso,
+    list_provisioning_options,
+    search_iso_files,
+)
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -23,11 +34,42 @@ ESXI_HOST = os.getenv('ESXI_HOST')
 ESXI_USER = os.getenv('ESXI_USER')
 ESXI_PASSWORD = os.getenv('ESXI_PASSWORD')
 
-app = FastAPI()
+_cors_raw = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+)
+CORS_ORIGINS = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+
+
+def bootstrap_admin_if_needed():
+    from db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if db.query(User).first():
+            return
+        u = os.getenv("INITIAL_ADMIN_USERNAME")
+        p = os.getenv("INITIAL_ADMIN_PASSWORD")
+        if not u or not p:
+            return
+        db.add(User(username=u.strip(), password_hash=hash_password(p)))
+        db.commit()
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    bootstrap_admin_if_needed()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -70,9 +112,60 @@ class CloneCommand(BaseModel):
     source_vm: str
     new_vm: str
 
-# API Endpoints
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class ProvisionFromIsoBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    datastore: str
+    iso_path: str
+    cpu: int = Field(ge=1, le=256)
+    cores_per_socket: int = Field(ge=1, le=128)
+    memory_mb: int = Field(ge=256, le=8_000_000)
+    disk_size_mb: int = Field(ge=1024, le=67_108_864)
+    disk_provisioning: Literal["thin", "lazyZeroedThick", "eagerZeroedThick"] = "thin"
+    network_name: str
+    guest_id: str = "ubuntu64Guest"
+    boot_firmware: Literal["bios", "efi"] = "bios"
+    hardware_version: str = "vmx-20"
+    nic_type: Literal["vmxnet3", "e1000", "e1000e"] = "vmxnet3"
+    scsi_controller_type: Literal["lsilogicsas", "lsilogic", "pvscsi"] = "lsilogicsas"
+    connect_cdrom: bool = True
+    connect_nic: bool = True
+    boot_from_iso_first: bool = True
+    cpu_hot_add: bool = False
+    memory_hot_plug: bool = False
+    auto_power_on: bool = False
+
+    @model_validator(mode="after")
+    def cpu_matches_cores(self):
+        if self.cpu % self.cores_per_socket != 0:
+            raise ValueError("cpu must be evenly divisible by cores_per_socket")
+        return self
+
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(body: LoginBody, db: Annotated[Session, Depends(get_db)]):
+    user = db.query(User).filter(User.username == body.username).first()
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return TokenResponse(access_token=create_access_token(user.username))
+
+
+# API Endpoints (authenticated)
 @app.get("/list")
-async def list_vms():
+async def list_vms(_: CurrentUser):
     si = connect_to_esxi()
     try:
         content = si.RetrieveContent()
@@ -98,7 +191,7 @@ async def list_vms():
 
 
 @app.get("/start")
-async def start_vm( vm_name: str = Query(...)):
+async def start_vm(_: CurrentUser, vm_name: str = Query(...)):
     si = connect_to_esxi()
     try:
         content = si.RetrieveContent()
@@ -116,7 +209,7 @@ async def start_vm( vm_name: str = Query(...)):
         Disconnect(si)
 
 @app.get("/stop")
-async def stop_vm( vm_name: str = Query(...)):
+async def stop_vm(_: CurrentUser, vm_name: str = Query(...)):
     si = connect_to_esxi()
     try:
         content = si.RetrieveContent()
@@ -134,7 +227,7 @@ async def stop_vm( vm_name: str = Query(...)):
         Disconnect(si)
 
 @app.get("/reset")
-async def reset_vm( vm_name: str = Query(...)):
+async def reset_vm(_: CurrentUser, vm_name: str = Query(...)):
     si = connect_to_esxi()
     try:
         content = si.RetrieveContent()
@@ -152,7 +245,7 @@ async def reset_vm( vm_name: str = Query(...)):
         Disconnect(si)
 
 @app.get("/screenshot")
-async def screenshot_vm(vm_name: str = Query(...)):
+async def screenshot_vm(_: CurrentUser, vm_name: str = Query(...)):
     try:
         si = connect_to_esxi()
         content = si.RetrieveContent()
@@ -194,7 +287,9 @@ async def screenshot_vm(vm_name: str = Query(...)):
         Disconnect(si)
 
 @app.post("/clone")
-async def clone_vm(command: CloneCommand, background_tasks: BackgroundTasks):
+async def clone_vm(
+    _: CurrentUser, command: CloneCommand, background_tasks: BackgroundTasks
+):
     source_vm_name, new_vm_name = command.source_vm, command.new_vm
     si = connect_to_esxi()
 
@@ -319,8 +414,75 @@ def run_clone_process(source_vm_name, new_vm_name):
     finally:
         Disconnect(si)
 
+@app.get("/provision/options")
+async def provision_options(_: CurrentUser):
+    si = connect_to_esxi()
+    try:
+        return list_provisioning_options(si)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        Disconnect(si)
+
+
+@app.get("/provision/isos")
+async def provision_isos(
+    _: CurrentUser,
+    datastore: str = Query(..., description="Datastore name to search"),
+    subpath: str = Query("", description="Optional subfolder under datastore"),
+):
+    si = connect_to_esxi()
+    try:
+        return {"isos": search_iso_files(si, datastore, subpath)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        Disconnect(si)
+
+
+@app.post("/provision/fromiso")
+async def provision_from_iso(_: CurrentUser, body: ProvisionFromIsoBody):
+    si = connect_to_esxi()
+    try:
+        return create_vm_from_iso(
+            si,
+            name=body.name,
+            datastore_name=body.datastore,
+            iso_path=body.iso_path,
+            cpu=body.cpu,
+            cores_per_socket=body.cores_per_socket,
+            memory_mb=body.memory_mb,
+            disk_size_mb=body.disk_size_mb,
+            disk_provisioning=body.disk_provisioning,
+            network_name=body.network_name,
+            guest_id=body.guest_id,
+            boot_firmware=body.boot_firmware,
+            hardware_version=body.hardware_version,
+            nic_type=body.nic_type,
+            scsi_controller_type=body.scsi_controller_type,
+            connect_cdrom=body.connect_cdrom,
+            connect_nic=body.connect_nic,
+            boot_from_iso_first=body.boot_from_iso_first,
+            cpu_hot_add=body.cpu_hot_add,
+            memory_hot_plug=body.memory_hot_plug,
+            auto_power_on=body.auto_power_on,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except vim.fault.DuplicateName as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except vim.fault.InvalidName as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        Disconnect(si)
+
+
 @app.get("/delete")
-async def delete_vm( vm_name: str = Query(...)):
+async def delete_vm(_: CurrentUser, vm_name: str = Query(...)):
     si = connect_to_esxi()
     try:
         content = si.RetrieveContent()

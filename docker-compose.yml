@@ -5,20 +5,35 @@ services:
       dockerfile: Dockerfile-backend
     container_name: esxi-web-manager
     environment:
-      - ESXI_HOST=your.esxi.host.ip
-      - ESXI_USER=root
-      - ESXI_PASSWORD=your_password
+      - ESXI_HOST=${ESXI_HOST:-your.esxi.host.ip}
+      - ESXI_USER=${ESXI_USER:-root}
+      - ESXI_PASSWORD=${ESXI_PASSWORD:-your_password}
+      - DATABASE_URL=sqlite:////app/data/app.db
+      - JWT_SECRET=${JWT_SECRET:-change-me-use-long-random-secret}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5656,http://127.0.0.1:5656,http://localhost:3000,http://127.0.0.1:3000}
+      - INITIAL_ADMIN_USERNAME=${INITIAL_ADMIN_USERNAME:-admin}
+      - INITIAL_ADMIN_PASSWORD=${INITIAL_ADMIN_PASSWORD:-changeme}
     volumes:
       - ./keys:/root/.ssh
+      - esxi_app_data:/app/data
     ports:
-      - "8000:8000"  
-    restart: always
-  
+      - "8000:8000"
+    restart: unless-stopped
+
   esxi-web-frontend:
-    image: nginx:alpine  
+    build:
+      context: .
+      dockerfile: Dockerfile-web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://127.0.0.1:8000}
     container_name: esxi-web-frontend
+    environment:
+      - NODE_ENV=production
     ports:
-      - "5656:80"
-    volumes:
-      - ./frontend:/usr/share/nginx/html:ro  
-    restart: always
+      - "5656:3000"
+    depends_on:
+      - esxi-web-manager
+    restart: unless-stopped
+
+volumes:
+  esxi_app_data:

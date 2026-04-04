@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y openssh-client && rm -rf /var/lib/apt/l
 COPY ./backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN mkdir -p /app/data
+
 # Copy the rest of the application code
 COPY ./backend .
 

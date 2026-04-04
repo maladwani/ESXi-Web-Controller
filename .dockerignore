@@ -1,0 +1,6 @@
+.git
+**/__pycache__
+**/*.pyc
+web/node_modules
+web/.next
+**/tmp_test.db

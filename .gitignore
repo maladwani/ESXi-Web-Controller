@@ -2,3 +2,7 @@ __pycache__
 .env
 id_rsa
 id_rsa.pub
+**/data/*.db
+*.db
+web/.next
+web/node_modules
